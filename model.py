@@ -1,80 +1,120 @@
+"""
+model.py  -  Original SPDNetwork modernised for PyTorch >= 2.0
+==============================================================
+
+Changes from the original:
+    * Uses nn.Module / nn.Parameter properly  (no bare Variables)
+    * Loads initial weights from .mat files OR random initialisation
+    * Uses updated spd_net_util  (torch.linalg, @staticmethod, ctx)
+    * update_para() uses pure-torch Stiefel retraction
+    * Compatible with standard PyTorch training loops
+"""
+
+import os
 import torch
-from torch.autograd import Variable
-import scipy.io as sio
+import torch.nn as nn
 import numpy as np
 import spd_net_util as util
 
+try:
+    import scipy.io as sio
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 
-class SPDNetwork(torch.nn.Module):
 
-    def __init__(self):
-        super(SPDNetwork, self).__init__()
-        tmp = sio.loadmat('./tmp/afew/w_1.mat')['w_1']
-        self.w_1_p = Variable(torch.from_numpy(tmp), requires_grad=True)
+class SPDNetwork(nn.Module):
+    """
+    Original SPDNet architecture:
+        Input (d?xd?) -> BiMap(d?) -> ReEig -> BiMap(d?) -> ReEig -> BiMap(d?) -> LogEig -> FC
 
-        tmp = sio.loadmat('./tmp/afew/w_2.mat')['w_2']
-        self.w_2_p = Variable(torch.from_numpy(tmp), requires_grad=True)
+    Parameters
+    ----------
+    dims        : list of 4 ints [d?, d?, d?, d?]  e.g. [400, 200, 100, 50]
+    n_classes   : number of output classes
+    init_dir    : path to directory with w_1.mat, w_2.mat, w_3.mat, fc.mat
+                  (if None, uses random orthogonal initialisation)
+    epsilon     : ReEig rectification threshold
+    """
 
-        tmp = sio.loadmat('./tmp/afew/w_3.mat')['w_3']
-        self.w_3_p = Variable(torch.from_numpy(tmp), requires_grad=True)
+    def __init__(
+        self,
+        dims: list[int] = (400, 200, 100, 50),
+        n_classes: int = 7,
+        init_dir: str | None = None,
+        epsilon: float = 1e-4,
+    ):
+        super().__init__()
+        d0, d1, d2, d3 = dims
+        self.epsilon = epsilon
 
-        tmp = sio.loadmat('./tmp/afew/fc.mat')['theta']
-        self.fc_w = Variable(torch.from_numpy(tmp.astype(np.float64)), requires_grad=True)
+        # -- BiMap weights on Stiefel manifold --
+        if init_dir is not None and HAS_SCIPY and os.path.isdir(init_dir):
+            w1 = torch.from_numpy(sio.loadmat(f"{init_dir}/w_1.mat")["w_1"])
+            w2 = torch.from_numpy(sio.loadmat(f"{init_dir}/w_2.mat")["w_2"])
+            w3 = torch.from_numpy(sio.loadmat(f"{init_dir}/w_3.mat")["w_3"])
+            fc = torch.from_numpy(
+                sio.loadmat(f"{init_dir}/fc.mat")["theta"].astype(np.float64)
+            )
+        else:
+            w1 = torch.empty(d0, d1, dtype=torch.float64)
+            nn.init.orthogonal_(w1)
+            w2 = torch.empty(d1, d2, dtype=torch.float64)
+            nn.init.orthogonal_(w2)
+            w3 = torch.empty(d2, d3, dtype=torch.float64)
+            nn.init.orthogonal_(w3)
+            fc = torch.randn(d3 * d3, n_classes, dtype=torch.float64) * 0.01
 
-    def forward(self, input):
-        batch_size = input.shape[0]
-        w_1_pc = self.w_1_p.contiguous()
-        w_1 = w_1_pc.view([1, w_1_pc.shape[0], w_1_pc.shape[1]])
+        self.w_1 = nn.Parameter(w1)
+        self.w_2 = nn.Parameter(w2)
+        self.w_3 = nn.Parameter(w3)
+        self.fc_w = nn.Parameter(fc)
 
-        w_2_pc = self.w_2_p.contiguous()
-        w_2 = w_2_pc.view([1,w_2_pc.shape[0], w_2_pc.shape[1]])
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        X : (B, d?, d?)  batch of SPD matrices
 
-        w_3_pc = self.w_3_p.contiguous()
-        w_3 = w_3_pc.view([1, w_3_pc.shape[0], w_3_pc.shape[1]])
+        Returns
+        -------
+        logits : (B, n_classes)
+        """
+        B = X.shape[0]
 
-        w_tX = torch.matmul(torch.transpose(w_1, dim0=1, dim1=2), input)
-        w_tXw = torch.matmul(w_tX, w_1)
-        X_1 = util.rec_mat_v2(w_tXw)
+        # -- Layer 1: BiMap + ReEig --
+        W1 = self.w_1.unsqueeze(0)                                 # (1, d0, d1)
+        X1 = W1.transpose(1, 2) @ X @ W1                           # (B, d1, d1)
+        X1 = util.rec_mat(X1, self.epsilon)
 
-        w_tX = torch.matmul(torch.transpose(w_2, dim0=1, dim1=2), X_1)
-        w_tXw = torch.matmul(w_tX, w_2)
-        X_2 = util.rec_mat_v2(w_tXw)
+        # -- Layer 2: BiMap + ReEig --
+        W2 = self.w_2.unsqueeze(0)
+        X2 = W2.transpose(1, 2) @ X1 @ W2
+        X2 = util.rec_mat(X2, self.epsilon)
 
-        w_tX = torch.matmul(torch.transpose(w_3, dim0=1, dim1=2), X_2)
-        w_tXw = torch.matmul(w_tX, w_3)
-        X_3 = util.log_mat_v2(w_tXw)
+        # -- Layer 3: BiMap + LogEig --
+        W3 = self.w_3.unsqueeze(0)
+        X3 = W3.transpose(1, 2) @ X2 @ W3
+        X3 = util.log_mat(X3)
 
-        feat = X_3.view([batch_size, -1])  # [batch_size, d]
-        logits = torch.matmul(feat, self.fc_w)  # [batch_size, num_class]
-
+        # -- FC --
+        feat = X3.reshape(B, -1)                                   # (B, d3*d3)
+        logits = feat @ self.fc_w                                   # (B, n_classes)
         return logits
 
-    def update_para(self, lr):
+    @torch.no_grad()
+    def update_para(self, lr: float):
+        """
+        Manual parameter update with Riemannian SGD on Stiefel manifold
+        for BiMap weights and standard SGD for FC weights.
+        """
+        for W in [self.w_1, self.w_2, self.w_3]:
+            if W.grad is None:
+                continue
+            new_W = util.update_para_riemann(W.data, W.grad.data, lr)
+            W.data.copy_(new_W)
+            W.grad.zero_()
 
-        egrad_w1 = self.w_1_p.grad.data.numpy()
-        egrad_w2 = self.w_2_p.grad.data.numpy()
-        egrad_w3 = self.w_3_p.grad.data.numpy()
-        w_1_np = self.w_1_p.data.numpy()
-        w_2_np = self.w_2_p.data.numpy()
-        w_3_np = self.w_3_p.data.numpy()
-
-        new_w_3 = util.update_para_riemann(w_3_np, egrad_w3, lr)
-        new_w_2 = util.update_para_riemann(w_2_np, egrad_w2, lr)
-        new_w_1 = util.update_para_riemann(w_1_np, egrad_w1, lr)
-
-        # print(np.sum(w_1_np))
-        # print(np.sum(np.square(w_3_np - new_w_3)))
-        # print(np.sum(np.square(w_2_np - new_w_2)))
-        # print(np.sum(np.square(w_1_np - new_w_1)))
-
-        self.w_1_p.data.copy_(torch.DoubleTensor(new_w_1))
-        self.w_2_p.data.copy_(torch.DoubleTensor(new_w_2))
-        self.w_3_p.data.copy_(torch.DoubleTensor(new_w_3))
-
-        self.fc_w.data -= lr * self.fc_w.grad.data
-        # Manually zero the gradients after updating weights
-        self.w_1_p.grad.data.zero_()
-        self.w_2_p.grad.data.zero_()
-        self.w_3_p.grad.data.zero_()
-        self.fc_w.grad.data.zero_()
-        # print('finished')
+        if self.fc_w.grad is not None:
+            self.fc_w.data -= lr * self.fc_w.grad.data
+            self.fc_w.grad.zero_()
